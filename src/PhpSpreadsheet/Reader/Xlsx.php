@@ -38,6 +38,7 @@ use SimpleXMLElement;
 use stdClass;
 use Throwable;
 use XMLReader;
+use XMLWriter;
 use ZipArchive;
 
 class Xlsx extends BaseReader
@@ -55,6 +56,20 @@ class Xlsx extends BaseReader
      * @var Xlsx\Theme
      */
     private static $theme = null;
+
+    /**
+     * Start row in batch reading.
+     *
+     * @var int
+     */
+    private $startBatchRowIndex;
+
+    /**
+     * End row in batch reading.
+     *
+     * @var int
+     */
+    private $endBatchRowIndex;
 
     /**
      * Create a new Xlsx Reader instance.
@@ -616,11 +631,28 @@ class Xlsx extends BaseReader
                             $docSheet->setTitle((string) $eleSheet['name'], false, false);
                             $fileWorksheet = $worksheets[(string) self::getArrayItem($eleSheet->attributes('http://schemas.openxmlformats.org/officeDocument/2006/relationships'), 'id')];
                             //~ http://schemas.openxmlformats.org/spreadsheetml/2006/main"
-                            $xmlSheet = simplexml_load_string(
-                                $this->securityScanner->scan($this->getFromZipArchive($zip, "$dir/$fileWorksheet")),
-                                'SimpleXMLElement',
-                                Settings::getLibXmlLoaderOptions()
-                            );
+                            // Load only specific rows by creating 'batch' file
+                            // Because there's not enough RAM to work with big files
+                            if ($this->startBatchRowIndex && $this->endBatchRowIndex) {
+                                $sheetFileName = 'zip://' . File::realpath($pFilename) . '#' . "$dir/$fileWorksheet";
+                                $batchFileName = File::sysGetTempDir() . '/' . pathinfo($pFilename)['filename'] . '_batch.tmp';
+
+                                $this->readBatchRows($sheetFileName, $batchFileName);
+
+                                $xmlSheet = simplexml_load_string(
+                                    $this->securityScanner->scanFile($batchFileName),
+                                    'SimpleXMLElement',
+                                    Settings::getLibXmlLoaderOptions()
+                                );
+
+                                unlink($batchFileName);
+                            } else {
+                                $xmlSheet = simplexml_load_string(
+                                    $this->securityScanner->scan($this->getFromZipArchive($zip, "$dir/$fileWorksheet")),
+                                    'SimpleXMLElement',
+                                    Settings::getLibXmlLoaderOptions()
+                                );
+                            }
 
                             $sharedFormulas = [];
 
@@ -2050,5 +2082,86 @@ class Xlsx extends BaseReader
                 $docSheet->protectCells((string) $protectedRange['sqref'], (string) $protectedRange['password'], true);
             }
         }
+    }
+
+    /**
+     * Set the batch reading interval.
+     *
+     * @param int $startRowIndex
+     * @param int $endRowIndex
+     */
+    public function setBatchRowIndex($startRowIndex, $endRowIndex): void
+    {
+        $this->startBatchRowIndex = $startRowIndex;
+        $this->endBatchRowIndex = $endRowIndex;
+    }
+
+    /**
+     * Perform the batch reading and save result into $batchFileName.
+     *
+     * @param string $sheetFileName
+     * @param string $batchFileName
+     */
+    private function readBatchRows($sheetFileName, $batchFileName): void
+    {
+        libxml_disable_entity_loader(false);
+
+        $reader = new XMLReader();
+        if (!$reader->open($sheetFileName)) {
+            throw new Exception('Failed to open the file ' . $sheetFileName);
+        }
+
+        $writer = new XMLWriter();
+        if (!$writer->openURI($batchFileName)) {
+            throw new Exception('Failed to open the file ' . $batchFileName);
+        }
+
+        $writer->startDocument('1.0', 'UTF-8');
+
+        $rowIndex = 0;
+        $reader->read();
+        while ($reader->name) {
+            if ($reader->name === 'row') {
+                if ($reader->nodeType === XMLReader::ELEMENT) {
+                    ++$rowIndex;
+                }
+                if ($rowIndex < $this->startBatchRowIndex || $rowIndex > $this->endBatchRowIndex) {
+                    $reader->next();
+
+                    continue;
+                }
+            }
+
+            if ($reader->nodeType === XMLReader::ELEMENT) {
+                $writer->startElement($reader->name);
+            } elseif ($reader->nodeType === XMLReader::END_ELEMENT) {
+                $writer->endElement();
+            } elseif ($reader->nodeType === XMLReader::TEXT) {
+                $writer->text($reader->value);
+            }
+
+            $needChangeRowIndex = $reader->name == 'row' || $reader->name == 'c';
+            if ($reader->hasAttributes && $reader->nodeType !== XMLReader::END_ELEMENT) {
+                while ($reader->moveToNextAttribute()) {
+                    if ($needChangeRowIndex && $reader->name == 'r') {
+                        $newRowIndex = $rowIndex - $this->startBatchRowIndex + 1;
+                        $newRowAttr = substr($reader->value, 0, -strlen((string) $rowIndex)) . $newRowIndex;
+                        $writer->writeAttribute($reader->name, $newRowAttr);
+                    } else {
+                        $writer->writeAttribute($reader->name, $reader->value);
+                    }
+                }
+            }
+
+            $reader->moveToElement();
+            if ($reader->isEmptyElement && $reader->nodeType === XMLReader::ELEMENT) {
+                $writer->endElement();
+            }
+
+            $reader->read();
+        }
+
+        $writer->endDocument();
+        $writer->flush();
     }
 }
